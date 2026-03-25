@@ -1,0 +1,47 @@
+name: Taboola Ads Pipeline
+
+on:
+  schedule:
+    - cron: '0 * * * *'    # Runs every hour, every day
+  workflow_dispatch:        # Allows manual trigger from GitHub Actions tab
+
+jobs:
+  run-taboola-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45     # Prophet can be resource-heavy, giving it a bit more time
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${__{{ runner.os }}-pip- }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Taboola Ads Pipeline
+        env:
+          TABOOLA_CLIENT_ID:     ${{ secrets.TABOOLA_CLIENT_ID }}
+          TABOOLA_CLIENT_SECRET: ${{ secrets.TABOOLA_CLIENT_SECRET }}
+          SHEETS_CLIENT_ID:      ${{ secrets.SHEETS_CLIENT_ID }}
+          SHEETS_CLIENT_SECRET:  ${{ secrets.SHEETS_CLIENT_SECRET }}
+          SHEETS_REFRESH_TOKEN:  ${{ secrets.SHEETS_REFRESH_TOKEN }}
+          TABOOLA_SHEET_ID:      ${{ secrets.TABOOLA_SHEET_ID }}
+        run: python taboola_ads_api.py
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Taboola Ads Pipeline FAILED at $(date)"
+          echo "Check the logs above for details."

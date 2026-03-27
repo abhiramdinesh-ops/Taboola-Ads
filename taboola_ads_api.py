@@ -13,6 +13,7 @@ import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from datetime import datetime, timedelta
+import pytz
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -50,6 +51,22 @@ MAX_RETRIES  = 3
 RETRY_WAIT   = 30
 
 # ============================================================
+# LOGGING
+# ============================================================
+
+pipeline_logs = []
+
+def log_message(level, message):
+    """Add a log entry with GMT timestamp"""
+    gmt_time = datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+    pipeline_logs.append({
+        "Timestamp": gmt_time,
+        "Level": level,
+        "Message": message
+    })
+    print(f"[{gmt_time}] {level}: {message}")
+
+# ============================================================
 # OAUTH TOKEN
 # ============================================================
 
@@ -60,6 +77,7 @@ def get_access_token():
     if _token_cache["token"] and now < _token_cache["expires_at"] - 60:
         return _token_cache["token"]
 
+    log_message("INFO", "Fetching new Taboola access token")
     resp = requests.post(TOKEN_URL, data={
         "client_id":     TABOOLA_CLIENT_ID,
         "client_secret": TABOOLA_CLIENT_SECRET,
@@ -69,6 +87,7 @@ def get_access_token():
     data = resp.json()
     _token_cache["token"]      = data["access_token"]
     _token_cache["expires_at"] = now + data.get("expires_in", 3600)
+    log_message("INFO", "Taboola access token acquired successfully")
     return _token_cache["token"]
 
 # ============================================================
@@ -83,10 +102,11 @@ def backstage_get(endpoint, params=None, raise_for_status=True):
     return resp
 
 def fetch_taboola_accounts():
-    print("Fetching account list from Taboola API...")
+    log_message("INFO", "Fetching account list from Taboola API...")
     try:
         resp = backstage_get("users/current/allowed-accounts").json()
     except Exception as e:
+        log_message("ERROR", f"Failed to fetch allowed accounts: {e}")
         raise RuntimeError(f"Failed to fetch allowed accounts: {e}")
 
     raw_results = resp.get("results", resp.get("items", resp.get("accounts", [])))
@@ -103,6 +123,8 @@ def fetch_taboola_accounts():
             continue
         seen_aids.add(aid)
         accounts.append({"aid": aid, "name": name, "account_id": account_id})
+    
+    log_message("INFO", f"Retrieved {len(accounts)} active accounts from API")
     return accounts
 
 # ============================================================
@@ -138,14 +160,18 @@ def fetch_account_insights(acct):
                     "ROAS": round(float(row.get("conversions_value", 0) or 0) / spent, 4) if spent > 0 else 0,
                     "CPL": round(spent / conversions, 4) if conversions > 0 else 0
                 })
+            log_message("INFO", f"Account '{acct_name}' ({aid}): Retrieved {len(rows)} rows")
             return rows, {"Account_ID": aid, "Account_Name": acct_name, "Account_Slug": resolved_id, "Rows": len(rows), "Status": "OK"}
         except Exception as e:
             if attempt == MAX_RETRIES:
+                log_message("ERROR", f"Account '{acct_name}' ({aid}): Failed after {MAX_RETRIES} attempts - {str(e)[:100]}")
                 return [], {"Account_ID": aid, "Account_Name": acct_name, "Account_Slug": resolved_id, "Rows": 0, "Status": f"FAILED: {str(e)[:50]}"}
+            log_message("WARNING", f"Account '{acct_name}' ({aid}): Attempt {attempt} failed, retrying...")
             time.sleep(1)
     return [], {"Account_ID": aid, "Account_Name": acct_name, "Account_Slug": resolved_id, "Rows": 0, "Status": "FAILED"}
 
 def pull_taboola_ads_data():
+    log_message("INFO", f"Starting data pull for {len(TABOOLA_ACCOUNTS)} accounts (Date range: {START_STR} to {END_STR})")
     get_access_token()
     all_rows, summary = [], []
     with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
@@ -154,6 +180,8 @@ def pull_taboola_ads_data():
             rows, s = future.result()
             all_rows.extend(rows)
             summary.append(s)
+    
+    log_message("INFO", f"Data pull complete: {len(all_rows)} total rows retrieved")
     return pd.DataFrame(all_rows), pd.DataFrame(summary)
 
 # ============================================================
@@ -161,12 +189,16 @@ def pull_taboola_ads_data():
 # ============================================================
 
 def run_prophet_forecast_taboola(df):
+    log_message("INFO", "Starting Prophet forecast generation")
     try:
         from prophet import Prophet
     except ImportError:
+        log_message("ERROR", "Prophet library not available, skipping forecast")
         return pd.DataFrame()
 
-    if df.empty: return pd.DataFrame()
+    if df.empty:
+        log_message("WARNING", "Empty dataframe provided, skipping forecast")
+        return pd.DataFrame()
 
     df_agg = df.copy()
     df_agg["data_date"] = pd.to_datetime(df_agg["Date"])
@@ -251,11 +283,15 @@ def run_prophet_forecast_taboola(df):
 
     results = []
     accounts = df_filtered[["account_name", "account_id"]].drop_duplicates()
+    
+    log_message("INFO", f"Generating forecasts for {len(accounts)} accounts")
 
     for _, acct_row in accounts.iterrows():
         acct, aid = acct_row["account_name"], acct_row["account_id"]
         camp_df = df_filtered[df_filtered["account_id"] == aid].copy()
-        if len(camp_df) < 14: continue
+        if len(camp_df) < 14:
+            log_message("WARNING", f"Account '{acct}' ({aid}): Insufficient data ({len(camp_df)} rows), skipping forecast")
+            continue
         try:
             f_fut, kpis, c_f, v_f = run_prophet(camp_df, df_raw[df_raw["account_id"] == aid])
             cost_map, conv_map = c_f.set_index("ds")["yhat"].to_dict(), v_f.set_index("ds")["yhat"].to_dict()
@@ -274,7 +310,10 @@ def run_prophet_forecast_taboola(df):
                     "Forecast_Avg_CPL": kpis["Forecast_Avg_CPL"] if is_last else None, "Forecast_Pct": kpis["Forecast_Pct"] if is_last else None,
                     "Forecast_Direction": kpis["Forecast_Direction"] if is_last else None, "MAPE": kpis["MAPE"] if is_last else None, "Reliability": kpis["Reliability"] if is_last else None
                 })
-        except: continue
+            log_message("INFO", f"Account '{acct}' ({aid}): Forecast generated successfully")
+        except Exception as e:
+            log_message("ERROR", f"Account '{acct}' ({aid}): Forecast failed - {str(e)[:100]}")
+            continue
 
     # Build final table (Restored all CI and KPI column references)
     actual_table = df_filtered.copy().rename(columns={
@@ -291,6 +330,8 @@ def run_prophet_forecast_taboola(df):
         "Last7_CPL", "Prev7_CPL", "Last7_Cost", "Last7_Conversions", "Prev7_Cost", "Prev7_Conversions",
         "Trend", "Current_Pct", "Forecast_Avg_CPL", "Forecast_Pct", "Forecast_Direction", "MAPE", "Reliability"
     ]
+    
+    log_message("INFO", f"Forecast table generated: {len(final_table)} rows")
     return final_table[col_order]
 
 # ============================================================
@@ -298,36 +339,112 @@ def run_prophet_forecast_taboola(df):
 # ============================================================
 
 def get_sheets_client():
+    log_message("INFO", "Authenticating with Google Sheets")
     creds = Credentials(token=None, refresh_token=SHEETS_REFRESH_TOKEN, token_uri="https://oauth2.googleapis.com/token",
                         client_id=SHEETS_CLIENT_ID, client_secret=SHEETS_CLIENT_SECRET,
                         scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"])
     creds.refresh(Request())
+    log_message("INFO", "Google Sheets authentication successful")
     return gspread.authorize(creds)
 
 def write_to_sheet(sh, tab_name, df):
     try:
         ws = sh.worksheet(tab_name)
         ws.clear()
+        log_message("INFO", f"Sheet '{tab_name}': Cleared existing data")
     except:
         ws = sh.add_worksheet(title=tab_name, rows=50000, cols=25)
+        log_message("INFO", f"Sheet '{tab_name}': Created new worksheet")
+    
     if not df.empty:
         ws.update([list(df.columns)])
         data = df.fillna("").values.tolist()
         for i in range(0, len(data), 5000):
             ws.append_rows(data[i:i + 5000], value_input_option="USER_ENTERED")
+        log_message("INFO", f"Sheet '{tab_name}': Wrote {len(df)} rows")
+    else:
+        log_message("WARNING", f"Sheet '{tab_name}': No data to write")
+
+def write_logs_to_sheet(sh):
+    """Write logs to sheet, keeping only last 100 rows"""
+    try:
+        try:
+            ws = sh.worksheet("Logs")
+            # Read existing logs
+            existing_data = ws.get_all_records()
+            existing_logs = pd.DataFrame(existing_data) if existing_data else pd.DataFrame()
+        except:
+            ws = sh.add_worksheet(title="Logs", rows=150, cols=3)
+            existing_logs = pd.DataFrame()
+            log_message("INFO", "Created new 'Logs' worksheet")
+        
+        # Combine existing and new logs
+        new_logs = pd.DataFrame(pipeline_logs)
+        
+        if not existing_logs.empty and not new_logs.empty:
+            # Ensure columns match
+            if set(new_logs.columns) == set(existing_logs.columns):
+                combined_logs = pd.concat([existing_logs, new_logs], ignore_index=True)
+            else:
+                combined_logs = new_logs
+        elif not new_logs.empty:
+            combined_logs = new_logs
+        else:
+            combined_logs = existing_logs
+        
+        # Keep only last 100 rows
+        if len(combined_logs) > 100:
+            combined_logs = combined_logs.tail(100).reset_index(drop=True)
+        
+        # Write to sheet
+        ws.clear()
+        ws.update([list(combined_logs.columns)])
+        data = combined_logs.fillna("").values.tolist()
+        ws.append_rows(data, value_input_option="USER_ENTERED")
+        
+        print(f"[{datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}] INFO: Logs sheet updated with {len(combined_logs)} total rows (last 100 kept)")
+        
+    except Exception as e:
+        print(f"[{datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}] ERROR: Failed to write logs to sheet - {str(e)}")
 
 def main():
     global TABOOLA_ACCOUNTS
-    TABOOLA_ACCOUNTS = fetch_taboola_accounts()
-    taboola_df, df_summary = pull_taboola_ads_data()
-    forecast_df = run_prophet_forecast_taboola(taboola_df)
-    gc = get_sheets_client()
-    sh = gc.open_by_key(TABOOLA_SHEET_ID)
-    write_to_sheet(sh, "TaboolaAdsData", taboola_df)
-    write_to_sheet(sh, "TaboolaSummary", df_summary)
-    if not forecast_df.empty:
-        write_to_sheet(sh, "TaboolaForecast", forecast_df)
-    print("All done! ✓")
+    
+    log_message("INFO", "Pipeline execution started")
+    
+    try:
+        TABOOLA_ACCOUNTS = fetch_taboola_accounts()
+        taboola_df, df_summary = pull_taboola_ads_data()
+        forecast_df = run_prophet_forecast_taboola(taboola_df)
+        
+        log_message("INFO", "Connecting to Google Sheets")
+        gc = get_sheets_client()
+        sh = gc.open_by_key(TABOOLA_SHEET_ID)
+        
+        write_to_sheet(sh, "TaboolaAdsData", taboola_df)
+        write_to_sheet(sh, "TaboolaSummary", df_summary)
+        
+        if not forecast_df.empty:
+            write_to_sheet(sh, "TaboolaForecast", forecast_df)
+        else:
+            log_message("WARNING", "No forecast data generated")
+        
+        # Write logs last
+        write_logs_to_sheet(sh)
+        
+        log_message("INFO", "Pipeline execution completed successfully")
+        print("\nAll done! ✓")
+        
+    except Exception as e:
+        log_message("ERROR", f"Pipeline execution failed: {str(e)}")
+        # Still try to write logs even if pipeline fails
+        try:
+            gc = get_sheets_client()
+            sh = gc.open_by_key(TABOOLA_SHEET_ID)
+            write_logs_to_sheet(sh)
+        except:
+            pass
+        raise
 
 if __name__ == "__main__":
     main()

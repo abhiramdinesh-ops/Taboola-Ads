@@ -1,8 +1,8 @@
 name: Taboola Ads Pipeline
 
 on:
-  schedule:
-    - cron: '0 * * * *'    # Runs every hour, every day
+  #schedule:
+   # - cron: '0 * * * *'    # Runs every hour, every day
   workflow_dispatch:        # Allows manual trigger from GitHub Actions tab
 
 jobs:

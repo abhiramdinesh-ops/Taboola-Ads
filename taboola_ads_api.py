@@ -366,7 +366,7 @@ def write_to_sheet(sh, tab_name, df):
         log_message("WARNING", f"Sheet '{tab_name}': No data to write")
 
 def write_logs_to_sheet(sh):
-    """Write logs to sheet, keeping only last 100 rows"""
+    """Write logs to sheet, keeping only last 500 rows"""
     try:
         try:
             ws = sh.worksheet("Logs")
@@ -392,7 +392,7 @@ def write_logs_to_sheet(sh):
         else:
             combined_logs = existing_logs
         
-        # Keep only last 100 rows
+        # Keep only last 500 rows
         if len(combined_logs) > 500:
             combined_logs = combined_logs.tail(500).reset_index(drop=True)
         

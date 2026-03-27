@@ -393,8 +393,8 @@ def write_logs_to_sheet(sh):
             combined_logs = existing_logs
         
         # Keep only last 100 rows
-        if len(combined_logs) > 100:
-            combined_logs = combined_logs.tail(100).reset_index(drop=True)
+        if len(combined_logs) > 500:
+            combined_logs = combined_logs.tail(500).reset_index(drop=True)
         
         # Write to sheet
         ws.clear()
@@ -402,7 +402,7 @@ def write_logs_to_sheet(sh):
         data = combined_logs.fillna("").values.tolist()
         ws.append_rows(data, value_input_option="USER_ENTERED")
         
-        print(f"[{datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}] INFO: Logs sheet updated with {len(combined_logs)} total rows (last 100 kept)")
+        print(f"[{datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}] INFO: Logs sheet updated with {len(combined_logs)} total rows (last 500 kept)")
         
     except Exception as e:
         print(f"[{datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')}] ERROR: Failed to write logs to sheet - {str(e)}")

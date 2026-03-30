@@ -1,14 +1,14 @@
 name: Taboola Ads Pipeline
 
 on:
-  #schedule:
-   # - cron: '0 * * * *'    # Runs every hour, every day
-  workflow_dispatch:        # Allows manual trigger from GitHub Actions tab
+  # schedule:
+  #   - cron: '0 * * * *'   # Runs every hour
+  workflow_dispatch:
 
 jobs:
   run-taboola-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 45     # Prophet can be resource-heavy, giving it a bit more time
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repo
@@ -25,12 +25,13 @@ jobs:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: |
-            ${__{{ runner.os }}-pip- }}
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run Taboola Ads Pipeline
+      - name: Run Taboola Ads Pipeline (with retry)
+        id: run_pipeline
         env:
           TABOOLA_CLIENT_ID:     ${{ secrets.TABOOLA_CLIENT_ID }}
           TABOOLA_CLIENT_SECRET: ${{ secrets.TABOOLA_CLIENT_SECRET }}
@@ -38,10 +39,24 @@ jobs:
           SHEETS_CLIENT_SECRET:  ${{ secrets.SHEETS_CLIENT_SECRET }}
           SHEETS_REFRESH_TOKEN:  ${{ secrets.SHEETS_REFRESH_TOKEN }}
           TABOOLA_SHEET_ID:      ${{ secrets.TABOOLA_SHEET_ID }}
-        run: python taboola_ads_api.py
+        run: |
+          echo "▶️ First attempt..."
+          python taboola_ads_api.py > pipeline.log 2>&1 || (
+            echo "⚠️ First attempt failed. Retrying in 3 minutes..."
+            sleep 180
+            echo "🔁 Second attempt..."
+            python taboola_ads_api.py >> pipeline.log 2>&1
+          )
+
+      - name: Show last logs (always)
+        if: always()
+        run: |
+          echo "📄 Showing last 50 lines of log:"
+          tail -n 50 pipeline.log || echo "No log file found"
 
       - name: Notify on failure
         if: failure()
         run: |
-          echo "Taboola Ads Pipeline FAILED at $(date)"
-          echo "Check the logs above for details."
+          echo "❌ Taboola Ads Pipeline FAILED at $(date)"
+          echo "---- ERROR CONTEXT ----"
+          grep -i -A 5 -B 5 "error" pipeline.log || echo "No explicit ERROR found"
